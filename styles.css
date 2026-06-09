@@ -1,0 +1,9 @@
+/* Project typography */
+body, p, td, th, li, h1, h2, h3, h4 {
+  font-family: "Proxima Nova", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  color: #1F2729;
+}
+
+.main-container {
+  background-color: #F9FAFD;
+}

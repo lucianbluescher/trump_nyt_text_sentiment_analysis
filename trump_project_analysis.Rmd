@@ -1,0 +1,941 @@
+---
+title: "Does Scandal Coverage Change What Trump Talks About?"
+author: "Lucian Scher"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    css: styles.css
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5,
+  fig.align = "center"
+)
+```
+
+## The question
+
+This post follows my assignment for the MEDS course *EDS 231: Text Sentiment Analysis* taught by Mateo Robbins. It is meant as a practice and exploration of text sentiment methods. It is meant for purely academic purposes, in no way am I claiming scientific accuracy or causality. 
+
+I started with a pretty familiar worry about the news cycle: when scandal and conflict take over, climate and environment stuff gets pushed to the margins. Does that show up in what Trump *says*, not just what gets written about him?
+
+The narrowed version of that question for this project: in weeks when the *New York Times* is running a lot of **damaging** Trump coverage, does his speech lean more **conflict** and less **environmental** in the same stretch of time?
+
+I'm comparing Senate Democrats speech transcripts against NYT Article Search hits for `q = "trump"`. Nothing here is causal — I'm looking for patterns in the same weeks, not claiming Trump is "strategically distracting" because a line went up on a chart.
+
+------------------------------------------------------------------------
+
+## Setup and data window
+
+```{r packages}
+library(tidyverse)
+library(tidytext)
+library(lubridate)
+library(scales)
+library(quanteda)
+library(quanteda.textstats)
+library(topicmodels)
+library(ggrepel)
+```
+
+```{r theme-colors}
+# Shared colors and ggplot theme for all figures
+col_dark   <- "#1F2729"
+col_accent <- "#64D297"
+col_light  <- "#F9FAFD"
+
+plot_font <- if ("Proxima Nova" %in% systemfonts::system_fonts()$family) {
+  "Proxima Nova"
+} else {
+  "Helvetica"
+}
+
+theme_project <- function() {
+  theme_minimal(base_family = plot_font, base_size = 12) +
+    theme(
+      plot.background  = element_rect(fill = col_light, color = NA),
+      panel.background = element_rect(fill = col_light, color = NA),
+      panel.grid.minor = element_blank(),
+      text             = element_text(color = col_dark),
+      plot.title       = element_text(face = "bold", color = col_dark),
+      plot.subtitle    = element_text(color = col_dark),
+      axis.text        = element_text(color = col_dark),
+      legend.position  = "bottom"
+    )
+}
+
+cols_source <- c("NYT" = col_dark, "Trump" = col_accent)
+```
+
+The two corpora don't line up perfectly on time. NYT collection ran through the Article Search API in two-week chunks (Lab 1 workflow) until the API started returning **HTTP 429** rate-limit errors. That capped news coverage at late September. Speeches keep going well beyond that.
+
+| Source | Range | Notes |
+|--------|-------|-------|
+| NYT articles | Jul 7 – Sep 28, 2025 | 4,578 unique articles in cache |
+| Trump speeches | Jun 27, 2025 – May 20, 2026 | 419 transcripts |
+| **Paired analysis** | **Jul 7 – Sep 28, 2025** | only window where both exist |
+
+Everything downstream uses the overlap window unless noted otherwise.
+
+------------------------------------------------------------------------
+
+## Building the speech corpus
+
+```{r load-speeches}
+# Read full corpus and split on the 80-char divider between transcripts
+raw <- paste(readLines("data/speeches/corpus.txt"), collapse = "\n")
+chunks <- str_split(raw, "─{80}")[[1]]
+chunks <- chunks[str_trim(chunks) != ""]
+
+parse_transcript <- function(chunk) {
+  title <- str_match(chunk, "=== (.+?) \\|")[, 2]
+  url   <- str_match(chunk, "(https://[^\\n]+)")[, 2]
+  body  <- str_trim(str_replace(chunk, ".*https://[^\\n]+\\n", ""))
+  tibble(title, url, body)
+}
+
+# Dates are in the title suffix (M.D.YY), not the metadata field
+parse_title_date <- function(title) {
+  m <- str_match(title, "(\\d{1,2})\\.(\\d{1,2})\\.(\\d{2})$")
+  if (is.na(m[1, 1])) return(as.Date(NA))
+  y <- as.integer(m[1, 4])
+  y <- if (y < 70) 2000 + y else 1900 + y
+  make_date(y, as.integer(m[1, 2]), as.integer(m[1, 3]))
+}
+
+clean_text <- function(text) {
+  text |>
+    str_remove_all("\\[.*?\\]") |>
+    str_replace_all("\n", " ") |>
+    str_squish()
+}
+
+# Keep only lines spoken by Trump (transcripts include reporters/Q&A)
+trump_only <- function(text) {
+  hits <- str_extract_all(
+    text,
+    "(?<=(?:President Trump|Donald Trump|Trump):\\s{0,5})[^\\n]+"
+  )[[1]]
+  paste(hits, collapse = " ")
+}
+
+speech_df <- map_dfr(chunks, parse_transcript) |>
+  mutate(
+    date       = as.Date(sapply(title, parse_title_date), origin = "1970-01-01"),
+    year_month = floor_date(date, "month"),
+    week       = floor_date(date, "week"),
+    doc_id     = row_number(),
+    body_clean = clean_text(body),
+    body_trump = map_chr(body_clean, trump_only),
+    word_count = str_count(body_trump, "\\S+"),
+    source     = "speech"
+  )
+
+speech_df |> select(title, date, word_count) |> head()
+```
+
+Transcripts come from a single `corpus.txt` file scraped from the Senate Democrats newsroom. Each entry is split on the long divider line, then parsed for title, URL, and body text.
+
+The part that took some debugging: dates live in the title suffix (`5.20.26` style), not in the metadata field that says `unknown`. I also strip stage directions like `[inaudible]` and pull only lines attributed to Trump — the raw transcript has reporters and other speakers mixed in, and that's not what I'm trying to measure.
+
+------------------------------------------------------------------------
+
+## NYT articles
+
+```{r load-nyt}
+# Each cached RDS file = one API page from a 2-week fetch window
+nyt_files <- list.files(
+  "data/nyt/nyt_cache",
+  pattern = "^trump_.*\\.rds$",
+  full.names = TRUE
+)
+
+nyt_df <- map_dfr(nyt_files, readRDS) |>
+  distinct(web_url, .keep_all = TRUE) |>  # drop duplicate URLs across pages
+  mutate(
+    date       = as.Date(created_time),
+    year_month = floor_date(date, "month"),
+    week       = floor_date(date, "week"),
+    text       = paste(headline, snippet),  # API gives snippet, not full article
+    word_count = str_count(text, "\\S+"),
+    source     = "nyt",
+    doc_id     = row_number()
+  )
+
+nyt_df |> select(headline, date) |> head()
+```
+
+```{r overlap-dates}
+# Only weeks where both NYT and speech data exist
+overlap_start <- as.Date("2025-07-07")
+overlap_end   <- as.Date("2025-09-28")
+
+speech_overlap <- speech_df |> filter(date >= overlap_start, date <= overlap_end)
+nyt_overlap    <- nyt_df |> filter(date >= overlap_start, date <= overlap_end)
+```
+
+```{r validate}
+knitr::kable(
+  tibble(
+    metric = c(
+      "Speeches (all)", "Speeches (overlap)",
+      "NYT articles (all)", "NYT articles (overlap)",
+      "NYT dates", "Speech dates"
+    ),
+    value = c(
+      nrow(speech_df), nrow(speech_overlap),
+      nrow(nyt_df), nrow(nyt_overlap),
+      paste(min(nyt_df$date), "to", max(nyt_df$date)),
+      paste(min(speech_df$date, na.rm = TRUE), "to", max(speech_df$date, na.rm = TRUE))
+    )
+  ),
+  caption = "Data validation"
+)
+```
+
+NYT rows are built from cached API pulls — headline plus snippet, not full article text. (The Search API doesn't hand you the body; Lab 1 works the same way.) After deduping on URL, the counts in the table above are what actually enter the analysis.
+
+------------------------------------------------------------------------
+
+## Defining "damaging," "conflict," and "environmental"
+
+Professor feedback pushed me to be explicit about operational definitions instead of waving at "scandal coverage" in the abstract. I landed on three keyword lists. They're blunt, and I tried to say that out loud rather than pretend they're objective.
+
+```{r dictionaries}
+# Keyword lists for operationalizing themes (counts per 1,000 words)
+conflict_words <- c(
+  "war", "iran", "strike", "military", "nuclear", "bomb",
+  "invasion", "missile", "enemy", "attack", "troops"
+)
+damage_words <- c(
+  "epstein", "scandal", "indictment", "lawsuit", "trial",
+  "conviction", "jury", "deposition", "investigation"
+)
+env_words <- c(
+  "climate", "environment", "epa", "emissions", "carbon",
+  "renewable", "conservation", "pollution", "green"
+)
+
+dict_tbl <- bind_rows(
+  tibble(category = "Conflict / explosive", term = conflict_words),
+  tibble(category = "Damaging coverage",    term = damage_words),
+  tibble(category = "Environmental",        term = env_words)
+)
+
+knitr::kable(dict_tbl, caption = "Keyword dictionaries (operational definitions)")
+```
+
+```{r dict-visual, fig.height=4}
+dict_tbl |>
+  mutate(term = fct_inorder(term)) |>
+  ggplot(aes(term, category, fill = category)) +
+  geom_tile(color = col_light, linewidth = 0.5) +
+  scale_fill_manual(
+    values = c(
+      "Conflict / explosive" = col_dark,
+      "Damaging coverage" = "#4a5a5e",
+      "Environmental" = col_accent
+    )
+  ) +
+  coord_fixed(ratio = 0.35) +
+  labs(
+    title = "How we operationalize themes",
+    subtitle = "Each cell = one keyword counted per 1,000 words",
+    x = NULL, y = NULL, fill = NULL
+  ) +
+  theme_project() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+    legend.position = "none"
+  )
+```
+
+**Conflict** covers war-and-strike language (iran, military, nuclear, etc.). **Damaging** is legal/scandal framing (epstein, indictment, lawsuit…). **Environmental** is the climate bucket (epa, emissions, carbon…). I left out `ice` on purpose — in this corpus it shows up for icebreakers and immigration, not one clear theme.
+
+For keyness and LDA I also built stopword layers on top of the SMART list from Lab 2: news boilerplate, transcript filler (`uh`, `um`, applause), and a batch of place/name tokens that otherwise dominate the frequency tables without telling us much about the research question.
+
+```{r stopword-lists}
+# Lab 2 pattern: SMART + domain + transcript noise (letters-only keeps punctuation out)
+smart_sw <- get_stopwords(source = "smart")$word
+
+domain_sw <- c(
+  "said", "says", "told", "according", "reported", "noted", "added",
+  "stated", "announced", "mr", "ms", "inc", "corp", "llc",
+  "president", "trump", "donald", "white", "house",
+  "united", "states", "america", "american", "people", "country",
+  "think", "going", "know", "well", "right", "just", "like",
+  "year", "years", "percent", "million", "billion", "quarter",
+  "company", "companies", "firm", "business", "news", "times"
+)
+
+transcript_sw <- c(
+  "inaudible", "laughter", "applause", "crosstalk", "uh", "um", "huh",
+  "sir", "okay", "yeah", "gonna", "want", "got", "thank", "thanks",
+  "yes", "no", "one", "two", "three"
+)
+
+# Frequent place / person tokens in this corpus (Lab 2 domain list extension)
+geo_names_sw <- c(
+  "china", "iran", "israel", "ukraine", "russia", "gaza", "europe",
+  "biden", "harris", "obama", "musk", "zelensky", "netanyahu", "putin",
+  "washington", "york", "california", "texas", "florida", "mexico",
+  "canada", "london", "beijing", "moscow", "jerusalem", "india", "japan",
+  "korea", "afghanistan", "iraq", "syria", "venezuela", "greenland"
+)
+
+all_sw <- unique(c(smart_sw, domain_sw, transcript_sw, geo_names_sw))
+
+knitr::kable(
+  tibble(
+    list = c("SMART (Lab 2)", "Domain / news", "Transcript noise", "Places & names"),
+    n_terms = c(
+      length(smart_sw), length(domain_sw),
+      length(transcript_sw), length(geo_names_sw)
+    ),
+    example = c(
+      "the, and, of",
+      "said, reported, trump",
+      "uh, um, applause",
+      "iran, china, biden"
+    )
+  ),
+  caption = "Stopword layers applied before keyness and LDA"
+)
+
+dict_rate <- function(text, dict) {
+  # Share of words in `dict` per 1,000 tokens
+  if (!nzchar(text)) return(0)
+  words <- str_extract_all(tolower(text), "[a-z]+")[[1]]
+  if (length(words) == 0) return(0)
+  sum(words %in% dict) / length(words) * 1000
+}
+```
+
+"High-damage weeks" are the top quartile of weeks ranked by how many NYT articles hit at least one damaging keyword. I use that cut for the keyness target group — speeches from those weeks vs. everything else in the overlap.
+
+```{r high-damage-weeks}
+# Flag weeks in top quartile of NYT articles hitting damage keywords
+nyt_week_damage <- nyt_overlap |>
+  mutate(dmg = map_lgl(text, ~ dict_rate(.x, damage_words) > 0)) |>
+  group_by(week) |>
+  summarise(damage_docs = sum(dmg), nyt_articles = n(), .groups = "drop")
+
+damage_cut <- quantile(nyt_week_damage$damage_docs, 0.75, na.rm = TRUE)
+high_weeks <- nyt_week_damage |>
+  filter(damage_docs >= damage_cut) |>
+  pull(week)
+
+knitr::kable(
+  nyt_week_damage |>
+    mutate(high_damage_week = week %in% high_weeks) |>
+    arrange(week),
+  caption = paste0(
+    "Weekly NYT damaging coverage (cutoff = ", damage_cut,
+    " articles with damage terms)"
+  )
+)
+```
+
+------------------------------------------------------------------------
+
+## How much data do we actually have?
+
+The coverage plot is worth a look before interpreting anything else. NYT volume is steady through the summer and then stops cold at the dashed line — that's the rate limit, not a lack of news. Trump speeches keep showing up for months after that, but those later transcripts can't be paired with NYT in this project.
+
+```{r coverage-plot}
+bind_rows(
+  speech_df |> mutate(source = "Trump speeches"),
+  nyt_df |> mutate(source = "NYT articles")
+) |>
+  filter(!is.na(date)) |>
+  mutate(month = floor_date(date, "month")) |>
+  count(month, source) |>
+  ggplot(aes(month, n, fill = source)) +
+  geom_col(position = "dodge", width = 20) +
+  geom_vline(xintercept = overlap_end, linetype = "dashed", color = col_dark) +
+  scale_fill_manual(values = c("NYT articles" = col_dark, "Trump speeches" = col_accent)) +
+  scale_x_date(date_labels = "%b %Y") +
+  labs(title = "Documents per month by source", x = NULL, y = "Count", fill = NULL) +
+  theme_project()
+```
+
+------------------------------------------------------------------------
+
+## Keyword rates week by week
+
+Trump doesn't hold a press event every day, and when he does the transcript can be short. NYT, meanwhile, is pumping out dozens of snippet-length articles a week. Raw weekly averages for Trump look spiky and can sit on a totally different scale than NYT depending on the theme.
+
+So I show the raw per-1,000-word rates first, then z-score within each source and theme so the *shape* of the lines is easier to compare.
+
+```{r weekly-rates}
+# Per-document keyword rates, then weekly means by source
+doc_rates <- bind_rows(
+  speech_overlap |> transmute(week, source = "Trump", text = body_trump),
+  nyt_overlap |> transmute(week, source = "NYT", text = text)
+) |>
+  mutate(
+    conflict = map_dbl(text, dict_rate, dict = conflict_words),
+    damage   = map_dbl(text, dict_rate, dict = damage_words),
+    env      = map_dbl(text, dict_rate, dict = env_words)
+  )
+
+weekly_rates <- doc_rates |>
+  group_by(week, source) |>
+  summarise(
+    across(c(conflict, damage, env), ~ mean(.x, na.rm = TRUE)),
+    n_docs = n(),
+    .groups = "drop"
+  )
+
+weekly_long <- weekly_rates |>
+  pivot_longer(c(conflict, damage, env), names_to = "theme", values_to = "per_1000")
+
+theme_labs <- c(conflict = "Conflict", damage = "Damaging", env = "Environmental")
+```
+
+```{r weekly-raw, fig.height=6}
+weekly_long |>
+  ggplot(aes(week, per_1000, color = source)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(aes(size = n_docs), alpha = 0.7) +
+  facet_wrap(~theme, scales = "free_y", labeller = labeller(theme = theme_labs)) +
+  scale_color_manual(values = cols_source) +
+  scale_size(range = c(1, 4), guide = "none") +
+  labs(
+    title = "Mean keyword rate per week for overlapping dated",
+    subtitle = "Only 'Conflict' shows correlation between NYT and Trump.",
+    x = NULL, y = "Per 1,000 words", color = NULL
+  ) +
+  theme_project()
+```
+
+On the raw plot, **conflict** is the theme where NYT and Trump actually seem to move together. Damaging and environmental rates don't track as cleanly; NYT damaging coverage has its own rhythm tied to news events, and environmental language is sparse in both sources (which is kind of the point).
+
+```{r weekly-norm, fig.height=6}
+# Z-score within each source + theme so trend shape is comparable
+weekly_norm <- weekly_long |>
+  group_by(source, theme) |>
+  mutate(
+    z_score = (per_1000 - mean(per_1000, na.rm = TRUE)) /
+      sd(per_1000, na.rm = TRUE)
+  ) |>
+  ungroup()
+
+weekly_norm |>
+  ggplot(aes(week, z_score, color = source)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = col_dark) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  facet_wrap(~theme, labeller = labeller(theme = theme_labs)) +
+  scale_color_manual(values = cols_source) +
+  labs(
+    title = "Mean keyword rate per week normalized",
+    subtitle = "NYT follows Trump rhetoric closely behind",
+    x = NULL, y = "Z-score", color = NULL
+  ) +
+  theme_project()
+```
+
+After normalization, the conflict panel is even clearer: NYT often follows Trump's conflict rhetoric with a lag of a week or so, rather than leading it. That fits a story where presidential speech sets the frame and coverage catches up — though "fits" is doing a lot of work with twelve weeks of data.
+
+Environmental and damaging panels are flatter. I wouldn't read too much into small wiggles there given how few keyword hits per week we're counting.
+
+------------------------------------------------------------------------
+
+## The research question, plotted
+
+To answer the research question we plot three lines on one timeline: NYT damaging coverage, Trump conflict language, Trump environmental language. Shaded bands are the high-damage weeks from the quartile cut above.
+
+```{r research-question-plot, fig.height=6}
+# Align NYT damaging rate with Trump conflict + environmental on one timeline
+rq <- weekly_rates |>
+  filter(source == "NYT") |>
+  select(week, nyt_damage = damage) |>
+  full_join(
+    weekly_rates |>
+      filter(source == "Trump") |>
+      select(week, speech_conflict = conflict, speech_env = env),
+    by = "week"
+  ) |>
+  mutate(high_damage = week %in% high_weeks)
+
+rq_long <- rq |>
+  pivot_longer(
+    c(nyt_damage, speech_conflict, speech_env),
+    names_to = "series",
+    values_to = "rate"
+  ) |>
+  mutate(
+    series = recode(
+      series,
+      nyt_damage = "NYT damaging",
+      speech_conflict = "Trump conflict",
+      speech_env = "Trump environmental"
+    )
+  )
+
+ggplot(rq_long, aes(week, rate, color = series)) +
+  # Shade weeks where NYT damaging coverage is in top quartile
+  geom_rect(
+    data = rq |> filter(high_damage),
+    aes(xmin = week - 3, xmax = week + 3, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = col_accent, alpha = 0.12
+  ) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c(
+      "NYT damaging" = col_dark,
+      "Trump conflict" = col_accent,
+      "Trump environmental" = "#a8e6c8"
+    )
+  ) +
+  labs(
+    title = "Research question: damaging news vs conflict and environmental speech",
+    subtitle = "Shaded weeks = high NYT damaging coverage (top quartile)",
+    x = NULL, y = "Rate per 1,000 words", color = NULL
+  ) +
+  theme_project()
+```
+
+On raw rates, the three lines sit at different levels and the damaging-NYT series has sharper jumps than Trump's conflict or environmental tracks. Z-scoring in the next figure makes co-movement easier to spot.
+
+```{r research-question-norm, fig.height=6}
+# Z-score all three series within the overlap window
+rq_norm <- rq |>
+  mutate(
+    across(c(nyt_damage, speech_conflict, speech_env), ~ {
+      (.x - mean(.x, na.rm = TRUE)) / sd(.x, na.rm = TRUE)
+    })
+  )
+
+rq_norm_long <- rq_norm |>
+  pivot_longer(
+    c(nyt_damage, speech_conflict, speech_env),
+    names_to = "series",
+    values_to = "z"
+  ) |>
+  mutate(
+    series = recode(
+      series,
+      nyt_damage = "NYT damaging",
+      speech_conflict = "Trump conflict",
+      speech_env = "Trump environmental"
+    )
+  )
+
+ggplot(rq_norm_long, aes(week, z, color = series)) +
+  geom_rect(
+    data = rq_norm |> filter(high_damage),
+    aes(xmin = week - 3, xmax = week + 3, ymin = -Inf, ymax = Inf),
+    inherit.aes = FALSE,
+    fill = col_accent, alpha = 0.12
+  ) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = col_dark) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c(
+      "NYT damaging" = col_dark,
+      "Trump conflict" = col_accent,
+      "Trump environmental" = "#a8e6c8"
+    )
+  ) +
+  labs(
+    title = "Research question (normalized): comparable weekly trends",
+    subtitle = "Z-scores within overlap window; shaded = high-damage NYT weeks",
+    x = NULL, y = "Z-score", color = NULL
+  ) +
+  theme_project()
+```
+
+On the normalized chart, conflict and damaging lines rise together in a few shaded weeks; environmental language doesn't drop as sharply as I'd expect if the distraction story were neat and simple. Some high-damage weeks show conflict spikes with barely any movement on the environmental line.
+
+That's not a knockout against the idea — maybe the keyword lists miss how he talks about climate, or scandal weeks don't automatically crowd out other topics. It's just not the tidy "scandal up, climate down" pattern I hoped to see.
+
+```{r research-table}
+rq |>
+  mutate(high_damage = if_else(high_damage, "yes", "no")) |>
+  arrange(week) |>
+  knitr::kable(
+    digits = 2,
+    caption = "Weekly rates used in the research-question figure"
+  )
+```
+
+------------------------------------------------------------------------
+
+## Bing sentiment
+
+Keyword dictionaries catch specific themes; they miss overall tone. Lab 3's Bing lexicon is cruder — just a count of positive words minus negative words per document — but it gives a different angle on the same weeks.
+
+One thing worth knowing: Bing scores aren't on a −5 to +5 scale. They're raw word counts, so long Trump speeches produce bigger numbers than short NYT snippets. That's why the weekly z-score plot matters for comparison.
+
+```{r bing-scores}
+bing <- get_sentiments("bing")
+
+# Lab 3: count positive vs negative Bing words per document
+bing_score_df <- function(df, text_col) {
+  df |>
+    filter(!is.na(date), nzchar(.data[[text_col]])) |>
+    select(doc_id, date, year_month, week, text = all_of(text_col)) |>
+    mutate(text = str_remove_all(text, "[^A-Za-z\\s]")) |>
+    unnest_tokens(word, text) |>
+    filter(str_detect(word, "^[a-z]+$"), nchar(word) > 2) |>
+    anti_join(tibble(word = all_sw), by = "word") |>
+    inner_join(bing, by = "word") |>
+    count(doc_id, sentiment) |>
+    pivot_wider(names_from = sentiment, values_from = n, values_fill = 0) |>
+    mutate(bing_score = positive - negative) |>  # net word count, not a -5..5 scale
+    left_join(df |> select(doc_id, date, year_month, week), by = "doc_id")
+}
+
+speech_bing <- bing_score_df(speech_df, "body_trump") |>
+  mutate(source = "Trump")
+nyt_bing <- bing_score_df(nyt_df, "text") |>
+  mutate(source = "NYT")
+
+bing_weekly <- bind_rows(speech_bing, nyt_bing) |>
+  filter(date >= overlap_start, date <= overlap_end) |>
+  group_by(week, source) |>
+  summarise(mean_bing = mean(bing_score), n = n(), .groups = "drop")
+
+bing_weekly_norm <- bing_weekly |>
+  group_by(source) |>
+  mutate(
+    z_bing = (mean_bing - mean(mean_bing, na.rm = TRUE)) /
+      sd(mean_bing, na.rm = TRUE)
+  ) |>
+  ungroup()
+```
+
+```{r bing-plot-overlap, fig.height=5}
+bing_weekly |>
+  ggplot(aes(week, mean_bing, color = source)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(aes(size = n), alpha = 0.8) +
+  scale_color_manual(values = cols_source) +
+  scale_size(range = c(1.5, 5), guide = "none") +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 weeks") +
+  labs(
+    title = "Mean Bing sentiment by week (overlap window)",
+    subtitle = "Positive minus negative words per document; point size = n docs",
+    x = NULL, y = "Mean Bing score", color = NULL
+  ) +
+  theme_project()
+```
+
+The raw weekly chart mostly shows that Trump speeches accumulate more Bing hits than NYT snippets, which is why we normalize the scores for comparison. The normalized plot below shows that the two sources often move in the same direction, especially in August, a month with flooding, interest-rate talk, and National Guard deployment in D.C. that shows up in both corpora.
+
+```{r bing-plot-norm, fig.height=5}
+bing_weekly_norm |>
+  ggplot(aes(week, z_bing, color = source)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = col_dark) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = cols_source) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 weeks") +
+  labs(
+    title = "Bing sentiment normalized with z-score",
+    subtitle = "August: Flooding, Interest spike and National Guard in D.C.",
+    x = NULL, y = "Z-score", color = NULL
+  ) +
+  theme_project()
+```
+
+```{r bing-association, fig.height=6}
+# One row per week: NYT score vs Trump score for scatter + correlation
+bing_wide <- bing_weekly |>
+  select(week, source, mean_bing) |>
+  pivot_wider(names_from = source, values_from = mean_bing)
+
+bing_corr <- cor(bing_wide$NYT, bing_wide$Trump, use = "complete.obs")
+
+week_tokens <- function(text_vec) {
+  tibble(text = text_vec) |>
+    unnest_tokens(word, text) |>
+    filter(str_detect(word, "^[a-z]{3,}$")) |>
+    anti_join(tibble(word = all_sw), by = "word") |>
+    count(word, sort = TRUE)
+}
+
+week_shared_label <- function(wk) {
+  # Top words appearing in both NYT and Trump text that week (for point labels)
+  nyt_toks <- week_tokens(nyt_overlap |> filter(week == wk) |> pull(text))
+  trump_toks <- week_tokens(speech_overlap |> filter(week == wk) |> pull(body_trump))
+  shared <- inner_join(nyt_toks, trump_toks, by = "word", suffix = c("_nyt", "_trump")) |>
+    mutate(score = n_nyt + n_trump)
+
+  theme_words <- c(conflict_words, damage_words, env_words)
+  theme_hit <- shared |> filter(word %in% theme_words) |> slice_max(score, n = 2, with_ties = FALSE)
+  if (nrow(theme_hit) > 0) {
+    return(str_to_title(paste(theme_hit$word, collapse = ", ")))
+  }
+
+  hits <- shared |> slice_max(score, n = 2, with_ties = FALSE)
+  if (nrow(hits) == 0) return(format(wk, "%b %d"))
+  str_to_title(paste(hits$word, collapse = ", "))
+}
+
+bing_ann <- bing_wide |>
+  mutate(
+    date_label = format(week, "%b %d"),
+    topic_label = map_chr(week, week_shared_label),
+    point_label = paste0(date_label, "\n", topic_label)
+  )
+
+ggplot(bing_wide, aes(NYT, Trump)) +
+  geom_smooth(method = "lm", se = FALSE, color = col_accent, linewidth = 0.8) +
+  geom_point(size = 3, color = col_dark) +
+  geom_text_repel(
+    data = bing_ann,
+    aes(x = NYT, y = Trump, label = point_label),
+    size = 2.8,
+    color = col_dark,
+    segment.color = col_dark,
+    segment.size = 0.3,
+    lineheight = 0.9,
+    max.overlaps = 30,
+    box.padding = 0.35,
+    point.padding = 0.4,
+    min.segment.length = 0
+  ) +
+  labs(
+    title = "Bing sentiment association in overlapping weeks",
+    subtitle = "NYT and Trump Bing sentiment trend positive together",
+    x = "NYT mean Bing score", y = "Trump mean Bing score"
+  ) +
+  theme_project()
+
+knitr::kable(
+  bing_ann |>
+    transmute(
+      week = format(week, "%b %d, %Y"),
+      NYT, Trump,
+      shared_topic = topic_label
+    ),
+  digits = 2,
+  caption = "Weekly Bing scores with shared NYT–Trump topic labels"
+)
+```
+
+Normalized, both sources move in the same direction in several weeks. August stands out — flooding, interest-rate talk, National Guard deployment in D.C. show up in both corpora that month, and the Bing lines tick up together. The scatter plot below reinforces it: weeks when NYT tone shifts up tend to be weeks when Trump's does too. The labels on each point are shared vocabulary for that week, so you can see what they were both on about rather than just staring at correlated dots.
+
+------------------------------------------------------------------------
+
+## Keyness during high-damage news weeks
+
+Keyness (Lab 2) compares word use between two grouped corpora. Here the target is all Trump speeches from high-damage NYT weeks; the reference is everything else in the overlap. Not one speech — the whole pile of transcripts in each bucket.
+
+I spent time on stopwords because the first pass surfaced `uh`, punctuation tokens, and place names. SMART plus domain lists plus a letters-only filter gets closer to words that mean something for the question.
+
+```{r keyness-prep}
+# Target = speeches during high-damage NYT weeks; reference = all other overlap weeks
+speech_key <- speech_overlap |>
+  mutate(period = if_else(week %in% high_weeks, "high_damage", "reference")) |>
+  filter(nzchar(body_trump))
+
+knitr::kable(
+  speech_key |> count(period),
+  caption = "Documents in each keyness group"
+)
+```
+
+```{r keyness, fig.height=7}
+# Lab 2: log-likelihood (G²) for words over-used in target vs reference corpus
+corp <- corpus(speech_key, text_field = "body_trump", docid_field = "doc_id")
+docvars(corp, "period") <- speech_key$period
+
+toks <- tokens(corp) |>
+  tokens_tolower() |>
+  tokens_remove(all_sw) |>
+  tokens_select(pattern = "^[a-z]{3,}$", valuetype = "regex", selection = "keep")
+
+dfmat <- dfm(toks)
+dfmat_g <- dfm_group(dfmat, groups = docvars(dfmat, "period"))  # collapse to 2 groups
+
+result <- textstat_keyness(dfmat_g, target = "high_damage", measure = "lr")
+
+key_plot_df <- as_tibble(result) |>
+  filter(G2 > 0) |>
+  arrange(desc(G2)) |>
+  slice_head(n = 20)
+
+ggplot(key_plot_df, aes(G2, reorder(feature, G2))) +
+  geom_col(fill = col_accent, color = col_dark, linewidth = 0.2) +
+  labs(
+    title = "Keyness: Trump speech during high-damage NYT weeks",
+    subtitle = "Target = high-damage weeks | Reference = other weeks | G² statistic",
+    x = "Log-likelihood (G²)", y = NULL
+  ) +
+  theme_project()
+```
+
+Whatever lands at the top of this chart is what Trump over-uses when damaging NYT coverage is running hot — relative to his own speech in calmer weeks. Conflict-flavored terms showing up there would support the distraction read; environmental terms would cut against it. Worth remembering that keyness measures *unusualness*, not importance: a word can spike because of one long rally or one recurring phrase.
+
+------------------------------------------------------------------------
+
+## LDA topic groups
+
+Topic modeling (Lab 4) finds word clusters without being told the themes upfront. I ran separate models on NYT snippets and Trump speech (`k = 5`, Gibbs sampling), then labeled each topic by hand based on overlap with the keyword dictionaries — Conflict, Damaging, Environmental, or Other.
+
+```{r lda-helper}
+# Lab 4: LDA with k=5 topics, Gibbs sampling
+run_lda <- function(df, text_col, min_words = 50) {
+  dat <- df |> filter(!is.na(date), nzchar(.data[[text_col]]), word_count >= min_words)
+  corp <- corpus(dat, text_field = text_col, docid_field = "doc_id")
+  toks <- tokens(corp) |>
+    tokens_tolower() |>
+    tokens_remove(all_sw) |>
+    tokens_select(pattern = "^[a-z]{3,}$", valuetype = "regex", selection = "keep")
+  dfm_mat <- dfm_trim(dfm(toks), min_docfreq = 3)
+  dtm <- quanteda::convert(dfm_mat, to = "topicmodels")
+  mod <- LDA(dtm, k = 5, method = "Gibbs", control = list(iter = 500, seed = 321))
+  list(model = mod, data = dat)
+}
+
+assign_group <- function(terms) {
+  # Map each topic to Conflict / Damaging / Environmental / Other via keyword overlap
+  terms <- tolower(terms)
+  scores <- c(
+    Conflict = sum(terms %in% conflict_words),
+    Damaging = sum(terms %in% damage_words),
+    Environmental = sum(terms %in% env_words)
+  )
+  if (max(scores) == 0) return("Other")
+  names(which.max(scores))
+}
+
+label_topics <- function(mod) {
+  tidy(mod, matrix = "beta") |>
+    group_by(topic) |>
+    slice_max(beta, n = 10) |>
+    summarise(terms = list(term), .groups = "drop") |>
+    mutate(
+      topic = as.character(topic),
+      top_terms = map_chr(terms, ~ paste(.x, collapse = ", ")),
+      group = map_chr(terms, ~ assign_group(.x)),
+      label = paste0("T", topic, ": ", group)
+    )
+}
+```
+
+```{r lda-speech}
+speech_lda <- run_lda(speech_df, "body_trump")
+speech_labels <- label_topics(speech_lda$model)
+knitr::kable(speech_labels |> select(topic, group, top_terms),
+             caption = "Speech LDA topics → named groups")
+```
+
+```{r lda-nyt}
+nyt_lda <- run_lda(nyt_overlap, "text", min_words = 10)
+nyt_labels <- label_topics(nyt_lda$model)
+knitr::kable(nyt_labels |> select(topic, group, top_terms),
+             caption = "NYT LDA topics → named groups")
+```
+
+```{r lda-combined-plot, fig.height=7}
+# Sum topic proportions (gamma) by week and named group, overlap docs only
+topic_over_time <- function(lda_obj, labels, source_name, time_col = "week") {
+  dat <- lda_obj$data |>
+    filter(date >= overlap_start, date <= overlap_end)
+
+  theta <- as.data.frame(posterior(lda_obj$model)$topics)  # doc-topic proportions
+  theta$doc_id <- lda_obj$data$doc_id[as.integer(rownames(theta))]
+
+  theta |>
+    filter(doc_id %in% dat$doc_id) |>
+    pivot_longer(-doc_id, names_to = "topic", values_to = "gamma") |>
+    mutate(topic = sub("^X", "", topic)) |>
+    left_join(dat |> select(doc_id, period = all_of(time_col)), by = "doc_id") |>
+    left_join(labels |> select(topic, group, label), by = "topic") |>
+    group_by(period, group, source = source_name) |>
+    summarise(mean_gamma = sum(gamma), .groups = "drop")
+}
+
+lda_combined <- bind_rows(
+  topic_over_time(speech_lda, speech_labels, "Trump"),
+  topic_over_time(nyt_lda, nyt_labels, "NYT")
+)
+
+lda_combined_norm <- lda_combined |>
+  group_by(source, group) |>
+  mutate(
+    z_gamma = (mean_gamma - mean(mean_gamma, na.rm = TRUE)) /
+      sd(mean_gamma, na.rm = TRUE)  # z-score within each source + topic group
+  ) |>
+  ungroup()
+
+lda_combined |>
+  ggplot(aes(period, mean_gamma, color = group, linetype = source)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c(
+      "Conflict" = col_dark,
+      "Damaging" = "#4a5a5e",
+      "Environmental" = col_accent,
+      "Other" = "#a8e6c8"
+    )
+  ) +
+  scale_linetype_manual(values = c("NYT" = "solid", "Trump" = "dashed")) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 weeks") +
+  labs(
+    title = "LDA topic groups by week (overlap window)",
+    subtitle = "Solid = NYT | Dashed = Trump | Groups from keyword overlap",
+    x = NULL, y = "Mean topic share", color = "Topic group", linetype = "Source"
+  ) +
+  theme_project()
+
+lda_combined_norm |>
+  ggplot(aes(period, z_gamma, color = group, linetype = source)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = col_dark) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  scale_color_manual(
+    values = c(
+      "Conflict" = col_dark,
+      "Damaging" = "#4a5a5e",
+      "Environmental" = col_accent,
+      "Other" = "#a8e6c8"
+    )
+  ) +
+  scale_linetype_manual(values = c("NYT" = "solid", "Trump" = "dashed")) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 weeks") +
+  labs(
+    title = "LDA topic groups normalized",
+    subtitle = "Trends follow somewhat similar patterns (normalization adds spikes)",
+    x = NULL, y = "Z-score", color = "Topic group", linetype = "Source"
+  ) +
+  theme_project()
+```
+
+The raw weekly LDA chart is hard to read — NYT snippets and long speeches don't share the same baseline topic mix. Normalization helps: Trump and NYT lines for the same topic group often wiggle in the same direction, especially on conflict and "other" buckets, though the normalized plot also exaggerates spikes when a week only has a handful of documents.
+
+I wouldn't lean on LDA as the main evidence here. NYT snippets are short enough that topic proportions jump around. It's more of a sanity check that the keyword story isn't totally off.
+
+------------------------------------------------------------------------
+
+## Wrapping up
+
+The analysis found that **conflict language** is where NYT and Trump track each other most clearly, on both the keyword plots and the normalized Bing/LDA views. **Damaging coverage** in the Times has its own pulse tied to news cycles; it doesn't always line up with a simultaneous swing in what Trump says about conflict or environment in the same week.
+
+The distraction hypothesis, scandal up, climate talk down, gets partial support at best. Some high-damage weeks show conflict rhetoric rising without much drop in environmental keywords. That could mean the lists miss how he actually talks about climate, or that he doesn't drop environment talk as cleanly as my theory suggested. 
+
+Of course this analysis was meant to practice and explore course concepts. The data and methods have limitations:
+
+- NYT stops at Sep 28, 2025 (rate limit); speeches continue for months after
+- Snippets aren't full articles; Bing and LDA on NYT side are noisy
+- Keyword lists are blunt; `ice` omitted on purpose
+- Bing ignores negation ("not good" still counts positive)
+- Same-week correlation isn't strategy or causation
+
+------------------------------------------------------------------------
