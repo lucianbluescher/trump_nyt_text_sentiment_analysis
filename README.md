@@ -1,6 +1,8 @@
 # Trump Sentiment Analysis
 
-Compare Trump speech transcripts (Senate Democrats newsroom) with NYT Article Search coverage.
+Compare Trump speech transcripts [Senate Democrats newsroom](https://www.democrats.senate.gov/newsroom/trump-transcripts?pagenum_rs=20) with [NYT Article Search coverage](https://developer.nytimes.com/?it=a).
+
+
 
 ## Data
 
@@ -11,7 +13,7 @@ Compare Trump speech transcripts (Senate Democrats newsroom) with NYT Article Se
 
 NYT collection stopped at 6 of 23 planned windows due to HTTP 429 rate limiting.
 
-**Note:** `data/` is not in this repo (too large). Keep your local copy of `data/speeches/` and `data/nyt/nyt_cache/`, or re-run the scripts below to rebuild.
+**Note:** `data/` is not in this repo (too large). Re-run the scripts below to rebuild.
 
 ## Main analysis
 
@@ -26,4 +28,4 @@ rmarkdown::render("trump_project_analysis.Rmd")
 
 - `scripts/senate_dem_retrieval.py` — scrape transcripts
 - `scripts/run_nyt_retrieval.R` — NYT API fetch (2-week windows)
-- `scripts/run_nyt.sh` — run fetch in tmux
+- `scripts/run_nyt.sh` — run fetch in t-mux
